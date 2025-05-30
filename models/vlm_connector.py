@@ -11,7 +11,7 @@ from transformers import (
 from PIL import Image
 import requests
 from io import BytesIO
-from utils.data_utils import get_middle_frame
+from utils.data_utils import get_middle_frame, get_frame_differences, get_frame_differences_with_optical_flow
 
 
 class VLMConnector:
@@ -157,10 +157,13 @@ class VLMConnector:
                 image = Image.open(BytesIO(response.content)).convert("RGB")
             else:
                 image = Image.open(image).convert("RGB")
+        
+        # Enhance the question with specific instructions for VQA tasks
+        enhanced_question = self._enhance_question_for_vqa(question)
                 
         # Process input based on model type
         if "llava" in self.model_name.lower():
-            prompt = f"<image>\nUser: {question}\nAssistant:"
+            prompt = f"<image>\nUser: {enhanced_question}\nAssistant:"
             inputs = self.processor(prompt, image, return_tensors="pt").to(self.device)
             
             with torch.inference_mode():
@@ -172,11 +175,13 @@ class VLMConnector:
                 
             response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
             response = response.split("Assistant:")[1].strip()
-            return response
+            
+            # Post-process to get more concise answers
+            return self._post_process_answer(response, question)
             
         elif "blip" in self.model_name.lower():
             if "blip2" in self.model_name.lower() or "instructblip" in self.model_name.lower():
-                inputs = self.processor(image, question, return_tensors="pt").to(self.device, torch.float16)
+                inputs = self.processor(image, enhanced_question, return_tensors="pt").to(self.device, torch.float16)
                 
                 with torch.inference_mode():
                     output = self.model.generate(
@@ -185,19 +190,19 @@ class VLMConnector:
                     )
                     
                 response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
-                return response
+                return self._post_process_answer(response, question)
             else:
                 # Original BLIP
-                inputs = self.processor(image, question, return_tensors="pt").to(self.device)
+                inputs = self.processor(image, enhanced_question, return_tensors="pt").to(self.device)
                 
                 with torch.inference_mode():
                     output = self.model.generate(**inputs)
                     
                 response = self.processor.decode(output[0], skip_special_tokens=True)
-                return response
+                return self._post_process_answer(response, question)
                 
         elif "cogvlm" in self.model_name.lower():
-            inputs = self.processor(image, question, return_tensors="pt").to(self.device)
+            inputs = self.processor(image, enhanced_question, return_tensors="pt").to(self.device)
             
             with torch.inference_mode():
                 output = self.model.generate(
@@ -207,12 +212,12 @@ class VLMConnector:
                 )
                 
             response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
-            response = response.replace(question, "").strip()
-            return response
+            response = response.replace(enhanced_question, "").strip()
+            return self._post_process_answer(response, question)
             
         else:
             # Generic approach for other models
-            inputs = self.processor(image, question, return_tensors="pt").to(self.device)
+            inputs = self.processor(image, enhanced_question, return_tensors="pt").to(self.device)
             
             with torch.inference_mode():
                 output = self.model.generate(
@@ -222,8 +227,361 @@ class VLMConnector:
                 )
                 
             response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
-            return response
+            return self._post_process_answer(response, question)
+    
+    def _enhance_question_for_vqa(self, question):
+        """
+        Enhance the question with specific instructions for better VQA performance.
+        """
+        # Check if it's asking for expression classification
+        if "coarse expression" in question.lower():
+            return f"{question} Answer with only one word from: positive, negative, surprise."
+        elif "fine-grained expression" in question.lower():
+            return f"{question} Answer with only one word from: happiness, sadness, anger, fear, disgust, surprise."
+        elif "action unit" in question.lower() and "present" in question.lower():
+            return f"{question} List only the action unit names, separated by commas."
+        elif question.lower().startswith("is the action unit"):
+            return f"{question} Answer with only: yes or no."
+        else:
+            # For other questions, add general instruction for conciseness
+            return f"{question} Give a brief, direct answer."
+    
+    def _post_process_answer(self, response, original_question):
+        """
+        Post-process the model response to extract the most relevant answer.
+        """
+        # Clean up the response
+        response = response.strip()
+        
+        # For coarse expression questions
+        if "coarse expression" in original_question.lower():
+            # Look for key terms
+            response_lower = response.lower()
+            if "negative" in response_lower or "anger" in response_lower or "frown" in response_lower or "displeasure" in response_lower:
+                return "negative"
+            elif "positive" in response_lower or "happiness" in response_lower or "joy" in response_lower or "smile" in response_lower:
+                return "positive"
+            elif "surprise" in response_lower:
+                return "surprise"
+            else:
+                # Return first meaningful word
+                words = response.split()
+                for word in words:
+                    word_clean = word.lower().strip('.,!?"')
+                    if word_clean in ['positive', 'negative', 'surprise', 'happiness', 'anger', 'fear', 'sadness', 'disgust']:
+                        if word_clean in ['happiness', 'joy', 'smile']:
+                            return "positive"
+                        elif word_clean in ['anger', 'fear', 'sadness', 'disgust', 'frown']:
+                            return "negative"
+                        else:
+                            return word_clean
+        
+        # For fine-grained expression questions
+        elif "fine-grained expression" in original_question.lower():
+            response_lower = response.lower()
+            emotions = ['happiness', 'sadness', 'anger', 'fear', 'disgust', 'surprise']
+            for emotion in emotions:
+                if emotion in response_lower:
+                    return emotion
+        
+        # For yes/no questions
+        elif original_question.lower().startswith("is the"):
+            response_lower = response.lower()
+            if "yes" in response_lower or "shown" in response_lower:
+                return "yes"
+            elif "no" in response_lower or "not" in response_lower:
+                return "no"
+        
+        # For action unit questions, try to extract clean list
+        elif "action unit" in original_question.lower():
+            # Remove common prefixes
+            response = response.replace("The action units present are:", "")
+            response = response.replace("The action unit present is:", "")
+            response = response.strip(" :")
             
+            # Clean up formatting
+            if response.endswith("."):
+                response = response[:-1]
+        
+        # Default: return first sentence or first few words if it's too long
+        sentences = response.split('.')
+        first_sentence = sentences[0].strip()
+        
+        # If still too long, get first reasonable chunk
+        if len(first_sentence) > 50:
+            words = first_sentence.split()
+            if len(words) > 8:
+                return ' '.join(words[:8])
+        
+        return first_sentence if first_sentence else response
+
+    def answer_question_with_frame_difference(self, image, question, max_new_tokens=100, difference_type="first_to_middle"):
+        """
+        Answer a question about frame differences in an image sequence.
+        
+        Args:
+            image: Path to directory of images or single image path
+            question (str): Question to answer
+            max_new_tokens (int): Maximum number of tokens to generate
+            difference_type (str): Type of difference to compute ("first_to_middle", "middle_to_last", "both")
+            
+        Returns:
+            str: Answer to the question based on frame differences
+        """
+        if self.model is None:
+            raise ValueError("Model not loaded")
+            
+        # Enhance the question with specific instructions for VQA tasks
+        enhanced_question = self._enhance_question_for_vqa(question)
+            
+        # Handle directory of images for frame difference analysis
+        if isinstance(image, str) and os.path.isdir(image):
+            # Get frame differences
+            frame_data = get_frame_differences(image)
+            if frame_data is None:
+                raise ValueError(f"Could not compute frame differences for directory: {image}")
+            
+            # Select which difference image to use
+            if difference_type == "first_to_middle":
+                diff_image = frame_data['first_to_middle_diff']
+                context = "This image shows the difference between the first frame and middle frame of a micro-expression sequence. "
+            elif difference_type == "middle_to_last":
+                diff_image = frame_data['middle_to_last_diff']
+                context = "This image shows the difference between the middle frame and last frame of a micro-expression sequence. "
+            elif difference_type == "both":
+                # For now, use first_to_middle as primary, but could be extended to handle both
+                diff_image = frame_data['first_to_middle_diff']
+                context = "This image shows frame differences from a micro-expression sequence. "
+            else:
+                raise ValueError(f"Invalid difference_type: {difference_type}")
+            
+            if diff_image is None:
+                raise ValueError(f"Could not compute {difference_type} difference")
+            
+            # Add context to the question
+            contextualized_question = context + enhanced_question
+            
+            # Use the difference image for inference
+            image_to_process = diff_image
+            
+        else:
+            # Fallback to regular image processing
+            if isinstance(image, str):
+                if image.startswith(('http://', 'https://')):
+                    response = requests.get(image)
+                    image_to_process = Image.open(BytesIO(response.content)).convert("RGB")
+                else:
+                    image_to_process = Image.open(image).convert("RGB")
+            else:
+                image_to_process = image
+            
+            contextualized_question = enhanced_question
+                
+        # Process input based on model type
+        if "llava" in self.model_name.lower():
+            prompt = f"<image>\nUser: {contextualized_question}\nAssistant:"
+            inputs = self.processor(prompt, image_to_process, return_tensors="pt").to(self.device)
+            
+            with torch.inference_mode():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False
+                )
+                
+            response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+            response = response.split("Assistant:")[1].strip()
+            return self._post_process_answer(response, question)
+            
+        elif "blip" in self.model_name.lower():
+            if "blip2" in self.model_name.lower() or "instructblip" in self.model_name.lower():
+                inputs = self.processor(image_to_process, contextualized_question, return_tensors="pt").to(self.device, torch.float16)
+                
+                with torch.inference_mode():
+                    output = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens
+                    )
+                    
+                response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+                return self._post_process_answer(response, question)
+            else:
+                # Original BLIP
+                inputs = self.processor(image_to_process, contextualized_question, return_tensors="pt").to(self.device)
+                
+                with torch.inference_mode():
+                    output = self.model.generate(**inputs)
+                    
+                response = self.processor.decode(output[0], skip_special_tokens=True)
+                return self._post_process_answer(response, question)
+                
+        elif "cogvlm" in self.model_name.lower():
+            inputs = self.processor(image_to_process, contextualized_question, return_tensors="pt").to(self.device)
+            
+            with torch.inference_mode():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False
+                )
+                
+            response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+            response = response.replace(contextualized_question, "").strip()
+            return self._post_process_answer(response, question)
+            
+        else:
+            # Generic approach for other models
+            inputs = self.processor(image_to_process, contextualized_question, return_tensors="pt").to(self.device)
+            
+            with torch.inference_mode():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False
+                )
+                
+            response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+            return self._post_process_answer(response, question)
+
+    def answer_question_with_optical_flow(self, image, question, max_new_tokens=100, 
+                                        flow_type="first_to_middle", visualization_type="color_wheel"):
+        """
+        Answer a question about optical flow in an image sequence.
+        
+        Args:
+            image: Path to directory of images or single image path
+            question (str): Question to answer
+            max_new_tokens (int): Maximum number of tokens to generate
+            flow_type (str): Type of flow to analyze ("first_to_middle", "middle_to_last")
+            visualization_type (str): How to visualize flow ("color_wheel", "magnitude", "arrows")
+            
+        Returns:
+            str: Answer to the question based on optical flow analysis
+        """
+        if self.model is None:
+            raise ValueError("Model not loaded")
+            
+        # Enhance the question with specific instructions for VQA tasks
+        enhanced_question = self._enhance_question_for_vqa(question)
+            
+        # Handle directory of images for optical flow analysis
+        if isinstance(image, str) and os.path.isdir(image):
+            # Get frame data with optical flow
+            frame_data = get_frame_differences_with_optical_flow(image)
+            if frame_data is None:
+                raise ValueError(f"Could not compute optical flow for directory: {image}")
+            
+            # Select which optical flow visualization to use
+            if flow_type == "first_to_middle":
+                if visualization_type == "color_wheel":
+                    flow_image = frame_data['first_to_middle_flow_color']
+                elif visualization_type == "magnitude":
+                    flow_image = frame_data['first_to_middle_flow_magnitude']
+                else:
+                    flow_image = frame_data['first_to_middle_flow_color']  # fallback
+                    
+                context = f"This image shows optical flow (motion patterns) between the first frame and middle frame of a micro-expression sequence, visualized as {visualization_type}. Colors and patterns indicate direction and magnitude of facial movements. "
+                
+            elif flow_type == "middle_to_last":
+                if visualization_type == "color_wheel":
+                    flow_image = frame_data['middle_to_last_flow_color']
+                elif visualization_type == "magnitude":
+                    flow_image = frame_data['middle_to_last_flow_magnitude']
+                else:
+                    flow_image = frame_data['middle_to_last_flow_color']  # fallback
+                    
+                context = f"This image shows optical flow (motion patterns) between the middle frame and last frame of a micro-expression sequence, visualized as {visualization_type}. Colors and patterns indicate direction and magnitude of facial movements. "
+            else:
+                raise ValueError(f"Invalid flow_type: {flow_type}")
+            
+            if flow_image is None:
+                raise ValueError(f"Could not compute {flow_type} optical flow visualization")
+            
+            # Add context about optical flow to the question
+            contextualized_question = context + enhanced_question
+            
+            # Use the optical flow visualization for inference
+            image_to_process = flow_image
+            
+        else:
+            # Fallback to regular image processing
+            if isinstance(image, str):
+                if image.startswith(('http://', 'https://')):
+                    response = requests.get(image)
+                    image_to_process = Image.open(BytesIO(response.content)).convert("RGB")
+                else:
+                    image_to_process = Image.open(image).convert("RGB")
+            else:
+                image_to_process = image
+            
+            contextualized_question = enhanced_question
+                
+        # Process input based on model type (same as frame difference method)
+        if "llava" in self.model_name.lower():
+            prompt = f"<image>\nUser: {contextualized_question}\nAssistant:"
+            inputs = self.processor(prompt, image_to_process, return_tensors="pt").to(self.device)
+            
+            with torch.inference_mode():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False
+                )
+                
+            response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+            response = response.split("Assistant:")[1].strip()
+            return self._post_process_answer(response, question)
+            
+        elif "blip" in self.model_name.lower():
+            if "blip2" in self.model_name.lower() or "instructblip" in self.model_name.lower():
+                inputs = self.processor(image_to_process, contextualized_question, return_tensors="pt").to(self.device, torch.float16)
+                
+                with torch.inference_mode():
+                    output = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens
+                    )
+                    
+                response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+                return self._post_process_answer(response, question)
+            else:
+                # Original BLIP
+                inputs = self.processor(image_to_process, contextualized_question, return_tensors="pt").to(self.device)
+                
+                with torch.inference_mode():
+                    output = self.model.generate(**inputs)
+                    
+                response = self.processor.decode(output[0], skip_special_tokens=True)
+                return self._post_process_answer(response, question)
+                
+        elif "cogvlm" in self.model_name.lower():
+            inputs = self.processor(image_to_process, contextualized_question, return_tensors="pt").to(self.device)
+            
+            with torch.inference_mode():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False
+                )
+                
+            response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+            response = response.replace(contextualized_question, "").strip()
+            return self._post_process_answer(response, question)
+            
+        else:
+            # Generic approach for other models
+            inputs = self.processor(image_to_process, contextualized_question, return_tensors="pt").to(self.device)
+            
+            with torch.inference_mode():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False
+                )
+                
+            response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+            return self._post_process_answer(response, question)
+
     def available_models(self):
         """Return a list of supported models."""
         return [
