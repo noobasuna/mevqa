@@ -4,20 +4,31 @@ from PIL import Image
 import numpy as np
 import torch
 from matplotlib.colors import LinearSegmentedColormap
+from data_utils import get_middle_frame
 
 
-def display_image_with_answer(image_path, question, answer, ground_truth=None, figsize=(8, 8)):
+def display_image_with_answer(image_path, question, answer, ground_truth=None, figsize=(8, 8), use_middle_frame=True):
     """
     Display an image with question and answer.
     
     Args:
-        image_path: Path to the image
+        image_path: Path to the image or directory containing frames
         question: Question text
         answer: Model's answer
         ground_truth: Optional ground truth answer
         figsize: Figure size
+        use_middle_frame: Whether to use middle frame if image_path is a directory
     """
     try:
+        # Handle directory paths by getting middle frame
+        if os.path.isdir(image_path) and use_middle_frame:
+            middle_frame_path = get_middle_frame(image_path)
+            if middle_frame_path:
+                image_path = middle_frame_path
+            else:
+                print(f"Warning: Could not find middle frame in {image_path}")
+                return
+                
         image = Image.open(image_path).convert('RGB')
         
         plt.figure(figsize=figsize)
@@ -37,7 +48,7 @@ def display_image_with_answer(image_path, question, answer, ground_truth=None, f
         print(f"Error displaying image {image_path}: {e}")
 
 
-def visualize_results_grid(results, data_dir, num_samples=4, cols=2, figsize=(15, 12)):
+def visualize_results_grid(results, data_dir, num_samples=4, cols=2, figsize=(15, 12), use_middle_frame=True):
     """
     Visualize a grid of inference results.
     
@@ -47,6 +58,7 @@ def visualize_results_grid(results, data_dir, num_samples=4, cols=2, figsize=(15
         num_samples: Number of samples to display
         cols: Number of columns in the grid
         figsize: Figure size
+        use_middle_frame: Whether to use middle frame if image_path is a directory
     """
     samples = results[:num_samples]
     rows = (len(samples) + cols - 1) // cols
@@ -60,9 +72,21 @@ def visualize_results_grid(results, data_dir, num_samples=4, cols=2, figsize=(15
         prediction = result['prediction']
         ground_truth = result['ground_truth']
         
-        image_path = os.path.join(data_dir, dataset, f"{image_id}.jpg")
+        # Construct image path similar to demo.py
+        base_path = os.path.join(data_dir, dataset, f"{image_id[0:3]}", f"{image_id}")
         
         try:
+            # Handle directory paths
+            if os.path.isdir(base_path) and use_middle_frame:
+                image_path = get_middle_frame(base_path)
+                if not image_path:
+                    raise Exception(f"Could not find middle frame in {base_path}")
+            else:
+                # Try with .jpg extension
+                image_path = f"{base_path}.jpg"
+                if not os.path.exists(image_path):
+                    raise Exception(f"Image not found at {image_path}")
+            
             image = Image.open(image_path).convert('RGB')
             
             plt.subplot(rows, cols, i + 1)
@@ -81,15 +105,25 @@ def visualize_results_grid(results, data_dir, num_samples=4, cols=2, figsize=(15
     plt.show()
 
 
-def plot_attention_heatmap(image_path, attention_weights, figsize=(12, 5)):
+def plot_attention_heatmap(image_path, attention_weights, figsize=(12, 5), use_middle_frame=True):
     """
     Visualize attention weights as a heatmap overlaid on the image.
     
     Args:
-        image_path: Path to the image
+        image_path: Path to the image or directory containing frames
         attention_weights: Attention weights tensor or array (H, W)
         figsize: Figure size
+        use_middle_frame: Whether to use middle frame if image_path is a directory
     """
+    # Handle directory paths by getting middle frame
+    if os.path.isdir(image_path) and use_middle_frame:
+        middle_frame_path = get_middle_frame(image_path)
+        if middle_frame_path:
+            image_path = middle_frame_path
+        else:
+            print(f"Warning: Could not find middle frame in {image_path}")
+            return
+    
     # Load and prepare image
     image = Image.open(image_path).convert('RGB')
     
