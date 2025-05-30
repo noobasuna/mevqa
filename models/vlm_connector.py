@@ -184,12 +184,196 @@ class VLMConnector:
         
         return self._process_image_object(diff_image, question)
     
-    def _process_image_object(self, image, question):
-        """Process a PIL Image object with the question."""
-        # This method should be implemented based on your VLM architecture
-        # For now, return a placeholder
-        return "Frame difference analysis result"
+    def _process_single_image(self, image_path, question, max_new_tokens=100):
+        """
+        Process a single image file with a question.
+        
+        Args:
+            image_path: Path to the image file
+            question: Question to answer
+            max_new_tokens: Maximum number of tokens to generate
+            
+        Returns:
+            str: Answer to the question
+        """
+        if self.model is None:
+            raise ValueError("Model not loaded")
+            
+        # Load image
+        if isinstance(image_path, str):
+            if image_path.startswith(('http://', 'https://')):
+                response = requests.get(image_path)
+                image = Image.open(BytesIO(response.content)).convert("RGB")
+            else:
+                image = Image.open(image_path).convert("RGB")
+        else:
+            image = image_path
+            
+        # Enhance the question with specific instructions for VQA tasks
+        enhanced_question = self._enhance_question_for_vqa(question)
+        
+        return self._process_image_with_model(image, enhanced_question, max_new_tokens)
     
+    def _process_image_object(self, image, question, max_new_tokens=100):
+        """
+        Process a PIL Image object with the question.
+        
+        Args:
+            image: PIL Image object
+            question: Question to answer
+            max_new_tokens: Maximum number of tokens to generate
+            
+        Returns:
+            str: Answer to the question
+        """
+        if self.model is None:
+            raise ValueError("Model not loaded")
+            
+        # Enhance the question with specific instructions for VQA tasks
+        enhanced_question = self._enhance_question_for_vqa(question)
+        
+        return self._process_image_with_model(image, enhanced_question, max_new_tokens)
+    
+    def _process_image_with_model(self, image, question, max_new_tokens=100):
+        """
+        Process an image with the loaded model.
+        
+        Args:
+            image: PIL Image object
+            question: Question to answer
+            max_new_tokens: Maximum number of tokens to generate
+            
+        Returns:
+            str: Answer to the question
+        """
+        # Process input based on model type
+        if "llava" in self.model_name.lower():
+            prompt = f"<image>\nUser: {question}\nAssistant:"
+            inputs = self.processor(prompt, image, return_tensors="pt").to(self.device)
+            
+            with torch.inference_mode():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False
+                )
+                
+            response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+            response = response.split("Assistant:")[1].strip()
+            return self._post_process_answer(response, question)
+            
+        elif "blip" in self.model_name.lower():
+            if "blip2" in self.model_name.lower() or "instructblip" in self.model_name.lower():
+                inputs = self.processor(image, question, return_tensors="pt").to(self.device, torch.float16)
+                
+                with torch.inference_mode():
+                    output = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens
+                    )
+                    
+                response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+                return self._post_process_answer(response, question)
+            else:
+                # Original BLIP
+                inputs = self.processor(image, question, return_tensors="pt").to(self.device)
+                
+                with torch.inference_mode():
+                    output = self.model.generate(**inputs)
+                    
+                response = self.processor.decode(output[0], skip_special_tokens=True)
+                return self._post_process_answer(response, question)
+                
+        elif "cogvlm" in self.model_name.lower():
+            inputs = self.processor(image, question, return_tensors="pt").to(self.device)
+            
+            with torch.inference_mode():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False
+                )
+                
+            response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+            response = response.replace(question, "").strip()
+            return self._post_process_answer(response, question)
+            
+        else:
+            # Generic approach for other models
+            inputs = self.processor(image, question, return_tensors="pt").to(self.device)
+            
+            with torch.inference_mode():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False
+                )
+                
+            response = self.processor.batch_decode(output, skip_special_tokens=True)[0]
+            return self._post_process_answer(response, question)
+    
+    def _enhance_question_for_vqa(self, question):
+        """
+        Enhance question with context for better VQA performance.
+        
+        Args:
+            question: Original question
+            
+        Returns:
+            str: Enhanced question
+        """
+        # Add context based on question type
+        if "coarse expression" in question.lower():
+            return f"Looking at this facial expression image, {question} Please choose from: positive, negative, or neutral."
+        elif "fine-grained expression" in question.lower():
+            return f"Analyzing the facial expression in detail, {question} Please identify the specific emotion shown."
+        elif "action unit" in question.lower():
+            return f"Examining the facial movements and muscle activations, {question} Please identify the specific facial action units."
+        elif "is the action unit" in question.lower():
+            return f"Looking carefully at the facial muscles and movements, {question} Please answer yes or no."
+        else:
+            return question
+    
+    def _post_process_answer(self, response, original_question):
+        """
+        Post-process the model response to clean it up.
+        
+        Args:
+            response: Raw model response
+            original_question: Original question for context
+            
+        Returns:
+            str: Cleaned response
+        """
+        # Remove common artifacts
+        response = response.strip()
+        
+        # Remove repeated question text
+        if original_question.lower() in response.lower():
+            response = response.replace(original_question, "").strip()
+        
+        # Remove common prefixes
+        prefixes_to_remove = [
+            "Answer:", "The answer is:", "Based on the image,", 
+            "Looking at the image,", "In this image,", "I can see"
+        ]
+        
+        for prefix in prefixes_to_remove:
+            if response.lower().startswith(prefix.lower()):
+                response = response[len(prefix):].strip()
+        
+        # Clean up formatting
+        response = response.replace("\n", " ").strip()
+        
+        # Limit length if too long
+        if len(response) > 200:
+            response = response[:200].strip()
+            # Try to end at a sentence boundary
+            if '. ' in response:
+                response = response[:response.rfind('. ') + 1]
+        
+        return response
+
     def answer_question_with_optical_flow(self, image, question, max_new_tokens=100, 
                                         flow_type="first_to_middle", visualization_type="color_wheel"):
         """
